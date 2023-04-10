@@ -1,6 +1,13 @@
 #include <iostream>
 
-#define CACHE_SIZE          0x00FF + 1
+#define CACHE_SIZE          0xFF + 1
+
+#define LD_ST_NONE          0x00
+#define LD_ST_WORD          0x01
+#define LD_ST_BYTE_SIGNED   0x02
+#define LD_ST_HALF_SIGNED   0x03
+#define LD_ST_BYTE_UNSIGNED 0x04
+#define LD_ST_HALF_UNSIGNED 0x05
 
 #define RF_WR_SRC_TYP_MEM   0x00
 #define RF_WR_SRC_TYP_ALU   0x01
@@ -30,20 +37,25 @@
 
 class CPU {
 public:
-    // Clock cycle counter
-    uint64_t tick;
+    // Simulation related signals
+    bool startup; // Processor is  starting up
+    uint64_t tick; // Clock cycle counter
 
-    // Registers
-    uint32_t rf[32]; // 32 registers of 32-bit
+    // Internal registers
     uint32_t pc; // program counter
+    uint32_t rf[32]; // 32 registers of 32-bit
 
     // Caches
     uint32_t i_cache[CACHE_SIZE];
     uint32_t d_cache[CACHE_SIZE];
 
+    // Reset all class variables to default values
+    void reset();
+
     // Run one cycle of processor (execute one instruction)
     void run_one_tick();
 
+    // Class constructor
     CPU();
 
 private:
@@ -69,6 +81,7 @@ private:
         bool rf_wr_en;
 
         // D-Cache write-enable signal
+        uint8_t load_store_type;
         bool dcache_wr_en;
 
         // Branch, Jump type
@@ -125,6 +138,15 @@ private:
 };
 
 CPU::CPU() {
+    // set startup flag to 1
+    startup = 1;
+    
+    // set clock cycle counter to 0
+    tick = 0;
+
+    // set program counter to 0
+    pc = 0;
+
     // initialize all registers to zero
     for (int i = 0; i < 32; i++) {
         rf[i] = 0;
@@ -134,13 +156,41 @@ CPU::CPU() {
     for (int i = 0; i < CACHE_SIZE; i++) {
         i_cache[i] = 0;
         d_cache[i] = 0;
-    } 
+    }
+}
 
-    // set clock cycle counter to 0
-    tick = 0;
-
-    // set program counter to 0
+void CPU::reset() {
+    // Reset CPU Internal Variables
+    startup = 1;
     pc = 0;
+
+    // Reset Fetcher Signals
+    fetcher_signals.instruction = 0x00000000;
+
+    // Reset Decoder Signals
+    decoder_signals.imm = 0;
+    decoder_signals.alu_in1 = 0;
+    decoder_signals.alu_in2 = 0;
+    decoder_signals.alu_op = ALU_NOP;
+    decoder_signals.rf_rd_dat1 = 0;
+    decoder_signals.rf_rd_dat2 = 0;
+    decoder_signals.rf_wr_addr = 0;
+    decoder_signals.rf_wr_src_type = RF_WR_SRC_TYP_ALU; 
+    decoder_signals.rf_wr_en = false;
+    decoder_signals.load_store_type = LD_ST_NONE;
+    decoder_signals.dcache_wr_en = false;
+    decoder_signals.jump_type = JMP_NONE;
+    decoder_signals.is_valid = true;
+
+    // Reset Alu Signals
+    alu_signals.operation = ALU_NOP;
+    alu_signals.operand1 = 0;
+    alu_signals.operand2 = 0;
+    alu_signals.result = 0;
+    alu_signals. overflow = false;
+
+    // Reset Memory Signals
+    memory_signals.mem_rd_dat = 0;
 }
 
 void CPU::run_one_tick() {
@@ -155,18 +205,28 @@ void CPU::run_one_tick() {
 
 void CPU::fetch() {
     // Update next PC address respect to ALU and Decode results.
-    if (decoder_signals.jump_type != JMP_NONE) {
-        if (decoder_signals.jump_type == JMP_JAL) {
-            pc = pc + decoder_signals.imm;
+    int32_t jmp_amount = 0;
+
+    if (startup == 1) {
+        startup = 0;
+        jmp_amount = 0;
+    } else if (decoder_signals.jump_type != JMP_NONE) {
+        if (decoder_signals.jump_type == JMP_JAL ||
+            (decoder_signals.jump_type == JMP_BRCH && alu_signals.result == 1)) {
+            jmp_amount = decoder_signals.imm;
         } else if (decoder_signals.jump_type == JMP_JALR) {
-            pc = decoder_signals.rf_rd_dat1 + decoder_signals.imm;
-        } else if (decoder_signals.jump_type == JMP_BRCH && alu_signals.result == 1) {
-            pc = pc + decoder_signals.imm;
+            jmp_amount = decoder_signals.rf_rd_dat1 + decoder_signals.imm;
+        } else {
+            jmp_amount = 4;
         }
-    } else if (tick != 0) {
-        pc = pc + 4;
+    } else {
+        jmp_amount = 4;
     }
 
+    if (jmp_amount % 4 != 0)
+        std::cerr << "Error: Next PC address is not a valid address and caused misaligned exception." << std::endl;
+
+    pc = pc + jmp_amount;
     fetcher_signals.instruction = i_cache[pc];
 }
 
@@ -192,6 +252,7 @@ void CPU::decode() {
     decoder_signals.rf_wr_addr = rd;
     decoder_signals.rf_wr_src_type = RF_WR_SRC_TYP_ALU; 
     decoder_signals.rf_wr_en = false;
+    decoder_signals.load_store_type = LD_ST_NONE;
     decoder_signals.dcache_wr_en = false;
     decoder_signals.jump_type = JMP_NONE;
     decoder_signals.is_valid = true;
@@ -263,19 +324,19 @@ void CPU::decode() {
             decoder_signals.rf_wr_src_type = RF_WR_SRC_TYP_MEM;
             switch (funct3) {
                 case 0b000: // LB: Load Byte then Sign-extend (signed)
-                    //TODO:
+                    decoder_signals.load_store_type = LD_ST_BYTE_SIGNED;
                     break;
                 case 0b001: // LH: Load Half then Sign-extend (signed)
-                    //TODO:
+                    decoder_signals.load_store_type = LD_ST_HALF_SIGNED;
                     break;
-                case 0b010: // LW: Load Word then Sign-extend (signed)
-                    //TODO:
+                case 0b010: // LW: Load Word
+                    decoder_signals.load_store_type = LD_ST_WORD;
                     break;
                 case 0b100: // LBU: Load Byte then zero-extend (unsigned)
-                    //TODO:
+                    decoder_signals.load_store_type = LD_ST_BYTE_UNSIGNED;
                     break;
                 case 0b101: // LHU: Load Half then zero-extend (unsigned)
-                    //TODO:
+                    decoder_signals.load_store_type = LD_ST_HALF_UNSIGNED;
                     break;
                 default:
                     std::cerr << "Error: unsupported Load instruction function code: " << funct3 << std::endl;
@@ -290,13 +351,13 @@ void CPU::decode() {
             decoder_signals.dcache_wr_en = true;
             switch (funct3) {
                 case 0b000: // SB: Store Byte
-                    //TODO:
+                    decoder_signals.load_store_type = LD_ST_BYTE_UNSIGNED;
                     break;
                 case 0b001: // SH: Store Half
-                    //TODO:
+                    decoder_signals.load_store_type = LD_ST_HALF_UNSIGNED;
                     break;
                 case 0b010: // SW: Store Word
-                    //TODO:
+                    decoder_signals.load_store_type = LD_ST_WORD;
                     break;
                 default:
                     std::cerr << "Error: unsupported Store instruction function code: " << funct3 << std::endl;
@@ -421,10 +482,50 @@ void CPU::execute() {
 }
 
 void CPU::memory() {
+    if (decoder_signals.load_store_type == LD_ST_NONE) return;
+    
     if (decoder_signals.dcache_wr_en == true) {
-        d_cache[alu_signals.result] = decoder_signals.rf_rd_dat2;
+        int32_t write_data_tmp = decoder_signals.rf_rd_dat2;
+        switch (decoder_signals.load_store_type) {
+            case LD_ST_BYTE_UNSIGNED:
+                write_data_tmp = write_data_tmp & 0x000000FF;
+                break;
+            case LD_ST_HALF_UNSIGNED:
+                write_data_tmp = write_data_tmp & 0x0000FFFF;
+                break;
+            case LD_ST_WORD:
+                write_data_tmp = write_data_tmp;
+                break;
+            default:
+                std::cerr << "Error: memory write type is not valid. ";
+                break;
+        }
+        d_cache[alu_signals.result] = write_data_tmp;
     } else {
-        memory_signals.mem_rd_dat = d_cache[alu_signals.result];
+        int32_t read_data_tmp = d_cache[alu_signals.result];
+        switch (decoder_signals.load_store_type) {
+            case LD_ST_BYTE_SIGNED:
+                read_data_tmp = read_data_tmp & 0x000000FF;
+                read_data_tmp = (read_data_tmp << 24) >> 24;
+                break;
+            case LD_ST_HALF_SIGNED:
+                read_data_tmp = read_data_tmp & 0x0000FFFF;
+                read_data_tmp = (read_data_tmp << 16) >> 16;
+                break;
+            case LD_ST_BYTE_UNSIGNED:
+                read_data_tmp = read_data_tmp & 0x000000FF;
+                break;
+            case LD_ST_HALF_UNSIGNED:
+                read_data_tmp = read_data_tmp & 0x0000FFFF;
+                break;
+            case LD_ST_WORD:
+                read_data_tmp = read_data_tmp;
+                break;
+            default:
+                std::cerr << "Error: memory read type is not valid. ";
+                break;
+        }
+        memory_signals.mem_rd_dat = read_data_tmp;
     }
 }
 
@@ -583,18 +684,62 @@ void CPU::i_to_b(uint32_t in, uint8_t *out) {
     out[0] = in / 2 + '0';
 }
 
+void test1_simple_test(CPU &cpu) {
+//=============================================================================================================//
+//==================================================================== intr   rd      ,   rs1     ,   rs2    ==//
+//=============================================================================================================//
+    cpu.i_cache[0x00000000] = 0b00000000000100000000000010010011; //== addi   x1      ,   x0      ,   0x1    ==//
+    cpu.i_cache[0x00000004] = 0b00000000001000000000000100010011; //== addi   x2      ,   x0      ,   0x2    ==//
+    cpu.i_cache[0x00000008] = 0b00000000001000001000000100110011; //== add    x2      ,   x1      ,   x2     ==//
+    cpu.i_cache[0x0000000c] = 0b01101111111000000000000110010011; //== addi   x3      ,   x0      ,   0x0EFE ==//
+    cpu.i_cache[0x00000010] = 0b00000000001100000000000000100011; //== sb     x0(0)   ,   x3                 ==//
+    cpu.i_cache[0x00000014] = 0b00000000000000000000001000000011; //== lb     x4      ,   x0(0)              ==//
+    cpu.i_cache[0x00000018] = 0b00000000000000000100001010000011; //== lbu    x5      ,   x0(0)              ==//
+    cpu.i_cache[0x0000001c] = 0b00000000000000000000000001101111; //== jal    x0      ,   0                  ==//
+//=============================================================================================================//
+}
+
+void test2_fibonacci(CPU &cpu) {
+//=============================================================================================================//
+//==================================================================== intr   rd      ,   rs1     ,   rs2    ==//
+//=============================================================================================================//
+    cpu.i_cache[0x00000000] = 0b00000000110100000000001010010011; //== addi   x5      ,   x0      ,   0xD    ==//
+    cpu.i_cache[0x00000004] = 0b00000000000000000000000010010011; //== addi   x1      ,   x0      ,   0x0    ==//
+    cpu.i_cache[0x00000008] = 0b00000000000100000000000100010011; //== addi   x2      ,   x0      ,   0x1    ==//
+    cpu.i_cache[0x0000000c] = 0b00000000000000000000000110010011; //== addi   x3      ,   x0      ,   0x0    ==//
+    cpu.i_cache[0x00000010] = 0b00000000010100011000110001100011; //== beq    x3      ,   x5      ,   +24    ==//
+    cpu.i_cache[0x00000014] = 0b00000000001000001000001000110011; //== add    x4      ,   x1      ,   x2     ==//
+    cpu.i_cache[0x00000018] = 0b00000000000000010000000010110011; //== add    x1      ,   x2      ,   x0     ==//
+    cpu.i_cache[0x0000001c] = 0b00000000000000100000000100110011; //== add    x2      ,   x4      ,   x0     ==//
+    cpu.i_cache[0x00000020] = 0b00000000000100011000000110010011; //== addi   x3      ,   x3      ,   0x1    ==//
+    cpu.i_cache[0x00000024] = 0b11111110110111111111000001101111; //== jal    x0      ,   -20                ==//
+    cpu.i_cache[0x00000028] = 0b00000000001000000001000000100011; //== sh     x0(0)   ,   x2                 ==//
+    cpu.i_cache[0x0000002c] = 0b00000000000000000000000001101111; //== jal    x0      ,   0                  ==//
+//=============================================================================================================//
+}
+
 int main() {
     CPU cpu;
     
-    cpu.i_cache[0x00000000] = 0b00000000000100000000000010010011; // addi x1, x0, 0x1
-    cpu.i_cache[0x00000004] = 0b00000000001000000000000100010011; // addi x2, x0, 0x2
-    cpu.i_cache[0x00000008] = 0b00000000001000001000000100110011; // add  x2, x1, x2
-    cpu.i_cache[0x0000000c] = 0b11111111110111111111000001101111; // jal  x0, -4
-
+    printf("======================================= Test 1 =======================================\n");
+    cpu.reset();
+    test1_simple_test(cpu);
     for (int i = 0; i < 10; i++) {
         cpu.run_one_tick();
-        printf("Cycle %2d -> x1 = 0x%x, x2 = 0x%x\n", i + 1, cpu.rf[1], cpu.rf[2]);
+        printf("Cycle %03llu -> x1=0x%08x, x2=0x%08x, x3=0x%08x, x4=0x%08x, x5=0x%08x, Mem[0]=0x%08x\n",
+            cpu.tick, cpu.rf[1], cpu.rf[2], cpu.rf[3], cpu.rf[4], cpu.rf[5], cpu.d_cache[0]);
     }
+
+    printf("======================================= Test 2 =======================================\n");
+    cpu.reset();
+    test2_fibonacci(cpu);
+    for (int i = 0; i < 90; i++) {
+        cpu.run_one_tick();
+        printf("Cycle %03llu -> x1=0x%08x, x2=0x%08x, x3=0x%08x, x4=0x%08x, x5=0x%08x, Mem[0]=0x%08x\n",
+            cpu.tick, cpu.rf[1], cpu.rf[2], cpu.rf[3], cpu.rf[4], cpu.rf[5], cpu.d_cache[0]);
+    }
+
+    printf("====================================== Test End ======================================\n");
     
     return 0;
 }
